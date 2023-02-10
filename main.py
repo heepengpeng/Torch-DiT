@@ -6,7 +6,9 @@ import string
 import zipfile
 
 import torch
+import torch.distributed as dist
 from diffusers.models import AutoencoderKL
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision.utils import save_image
 
 from diffusion import create_diffusion
@@ -35,23 +37,29 @@ def zipDir(dirpath, outFullName):
 # Setup PyTorch:
 torch.manual_seed(0)
 torch.set_grad_enabled(False)
-device = "cuda"
 num_sampling_steps = 250
 cfg_scale = 4.0
+
+# Multi GPU
+dist.init_process_group("nccl")
+rank = dist.get_rank()
+device = rank % torch.cuda.device_count()
 
 # Load model:
 image_size = 256
 assert image_size in [256, 512], "We only provide pre-trained models for 256x256 and 512x512 resolutions."
 latent_size = image_size // 8
-model = DiT_XL_2(input_size=latent_size).to(device)
+model = DiT_XL_2(input_size=latent_size)
+model = DDP(model.to(device), device_ids=[rank])
 state_dict = find_model(f"DiT-XL-2-{image_size}x{image_size}.pt")
-model.load_state_dict(state_dict)
+model.load_state_dict(state_dict, False)
+
 model.eval()
 
 vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
 
 # Labels to condition the model with:
-class_count = 10
+class_count = 1000
 l = list(range(class_count))
 n = 10
 class_labels_batch = [l[i:i + n] for i in range(0, len(l), n)]
@@ -64,7 +72,7 @@ for i in range(repeat_num):
         diffusion = create_diffusion(str(num_sampling_steps))
         # Create sampling noise:
         n = len(class_labels)
-        z = torch.randn(n, 4, latent_size, latent_size, device=device)
+        z = torch.randn(n, 4, latent_size, latent_size)
         y = torch.tensor(class_labels, device=device)
 
         # Setup classifier-free guidance:
@@ -76,7 +84,7 @@ for i in range(repeat_num):
         # Sample images:
         # # Save and display images:
         samples = diffusion.p_sample_loop(
-            model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True,
+            model.forward, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True,
             device=device
         )
         samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
