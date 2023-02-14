@@ -3,12 +3,11 @@
 import os.path
 import random
 import string
+import time
 import zipfile
 
 import torch
-import torch.distributed as dist
 from diffusers.models import AutoencoderKL
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision.utils import save_image
 
 from diffusion import create_diffusion
@@ -34,32 +33,27 @@ def zipDir(dirpath, outFullName):
             zip.write(os.path.join(path, filename), os.path.join(fpath, filename))
 
 
+start_time = time.time()
 # Setup PyTorch:
 torch.manual_seed(0)
 torch.set_grad_enabled(False)
 num_sampling_steps = 250
 cfg_scale = 4.0
-
-# Multi GPU
-dist.init_process_group("nccl")
-rank = dist.get_rank()
-device = rank % torch.cuda.device_count()
-
+device = 'cuda'
 # Load model:
 image_size = 256
 assert image_size in [256, 512], "We only provide pre-trained models for 256x256 and 512x512 resolutions."
 latent_size = image_size // 8
-model = DiT_XL_2(input_size=latent_size)
-model = DDP(model.to(device), device_ids=[rank])
+model = DiT_XL_2(input_size=latent_size).to(device)
 state_dict = find_model(f"DiT-XL-2-{image_size}x{image_size}.pt")
 model.load_state_dict(state_dict, False)
 
 model.eval()
 
-vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
+vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to('cpu')
 
 # Labels to condition the model with:
-class_count = 1000
+class_count = 10
 l = list(range(class_count))
 n = 10
 class_labels_batch = [l[i:i + n] for i in range(0, len(l), n)]
@@ -72,7 +66,7 @@ for i in range(repeat_num):
         diffusion = create_diffusion(str(num_sampling_steps))
         # Create sampling noise:
         n = len(class_labels)
-        z = torch.randn(n, 4, latent_size, latent_size)
+        z = torch.randn(n, 4, latent_size, latent_size, device=device)
         y = torch.tensor(class_labels, device=device)
 
         # Setup classifier-free guidance:
@@ -88,7 +82,7 @@ for i in range(repeat_num):
             device=device
         )
         samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-        samples = vae.decode(samples / 0.18215).sample
+        samples = vae.decode(samples.cpu() / 0.18215).sample
         samples = samples.split(1)
         for idx, sample in enumerate(samples):
             save_dir = "sample/%d" % i
@@ -98,8 +92,5 @@ for i in range(repeat_num):
                        normalize=True,
                        value_range=(-1, 1))
     print("batch %d end" % i)
-
-    input_path = "./sample"
-    output_path = "./sample.zip"
-
-    zipDir(input_path, output_path)
+end_time = time.time()
+print(end_time - start_time)
